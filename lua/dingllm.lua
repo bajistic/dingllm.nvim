@@ -358,6 +358,62 @@ function M.handle_openai_spec_data(line, _) -- event_state not used
 	end
 end
 
+function M.handle_open_router_spec_data(data_stream)
+	-- Reuse the logic from your config, slightly adapted for SSE format
+	if not data_stream or data_stream == "" or data_stream:match("^:%s*$") then
+		return
+	end
+	if data_stream:match("^data:") then
+		local data_json = data_stream:sub(7)
+		if data_json == "[DONE]" then
+			return
+		end
+
+		local ok, decoded = pcall(vim.json.decode, data_json)
+		if ok and decoded then
+			-- Check common structures
+			if decoded.choices and decoded.choices[1] then
+				local choice = decoded.choices[1]
+				if choice.text then -- Specific field from your original code
+					M.write_string_at_cursor(choice.text)
+				elseif choice.delta and choice.delta.content then -- Standard OpenAI SSE field
+					M.write_string_at_cursor(choice.delta.content)
+				end
+			end
+		else
+			vim.notify("[dingllm] Failed to decode OpenRouter JSON: " .. data_json, vim.log.levels.WARN)
+		end
+	else
+		vim.notify("[dingllm] Unexpected data format from OpenRouter: " .. data_stream, vim.log.levels.DEBUG)
+	end
+end
+
+function M.make_legacy_openai_style_args(opts, prompt, _) -- Ignore system_prompt
+	local url = opts.url
+	local api_key = M.get_api_key(opts.api_key_name) -- Use plugin's get_api_key
+	if not api_key then
+		return nil
+	end
+
+	local data = {
+		prompt = prompt,
+		model = opts.model,
+		temperature = opts.temperature or 0.7,
+		stream = true,
+		max_tokens = opts.max_tokens and tonumber(opts.max_tokens) or 1024,
+	}
+	local args = { "-N", "-X", "POST", "-H", "Content-Type: application/json", "-d", vim.json.encode(data) }
+	table.insert(args, "-H")
+	table.insert(args, "Authorization: Bearer " .. api_key)
+	-- Add OpenRouter specific headers if needed
+	-- table.insert(args, "-H")
+	-- table.insert(args, "HTTP-Referer: YOUR_SITE_URL")
+	-- table.insert(args, "-H")
+	-- table.insert(args, "X-Title: YOUR_APP_NAME")
+	table.insert(args, url)
+	return args
+end
+
 -----------------------------------------------------------------------
 -- Generic LLM Invocation
 -----------------------------------------------------------------------
@@ -472,4 +528,57 @@ function M.complete_with_anthropic(opts)
 	M.invoke_llm_and_stream_into_editor(opts, M.make_anthropic_spec_curl_args, M.handle_anthropic_spec_data)
 end
 
+-- Store configured presets after setup
+local configured_presets = {}
+
+-- Default presets (optional, can be empty)
+local default_presets = {
+	ollama_default = {
+		opts = { model = "llama3", replace = false },
+		make_args_fn = M.make_ollama_spec_curl_args,
+		handle_data_fn = M.handle_ollama_spec_data,
+	},
+	-- Add other defaults if desired
+}
+
+-- Setup function for user configuration
+function M.setup(user_opts)
+	user_opts = user_opts or {}
+	configured_presets = vim.tbl_deep_extend("force", {}, default_presets, user_opts.presets or {})
+	-- You could add validation here to check if preset functions exist, etc.
+	vim.notify(
+		"[dingllm] Setup complete with " .. vim.tbl_count(configured_presets) .. " presets.",
+		vim.log.levels.INFO
+	)
+end
+
+-- NEW: Public function to invoke a configured preset
+function M.invoke_preset(name)
+	local preset = configured_presets[name]
+	if not preset then
+		vim.notify("[dingllm] Error: Preset '" .. name .. "' not found.", vim.log.levels.ERROR)
+		return
+	end
+
+	if not preset.opts then
+		vim.notify("[dingllm] Error: Preset '" .. name .. "' is missing 'opts' table.", vim.log.levels.ERROR)
+		return
+	end
+	if type(preset.make_args_fn) ~= "function" then
+		vim.notify("[dingllm] Error: Preset '" .. name .. "' has invalid 'make_args_fn'.", vim.log.levels.ERROR)
+		return
+	end
+	if type(preset.handle_data_fn) ~= "function" then
+		vim.notify("[dingllm] Error: Preset '" .. name .. "' has invalid 'handle_data_fn'.", vim.log.levels.ERROR)
+		return
+	end
+
+	-- Ensure default temperature if not set
+	preset.opts.temperature = preset.opts.temperature or 0.7
+
+	-- Call the core invocation function
+	M.invoke_llm_and_stream_into_editor(preset.opts, preset.make_args_fn, preset.handle_data_fn)
+end
+
+-- Ensure all public functions are returned
 return M
