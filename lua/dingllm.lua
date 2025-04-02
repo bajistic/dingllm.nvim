@@ -1,88 +1,262 @@
+-- ~/.config/nvim/lua/your_plugin_name/llm.lua (or similar)
 local M = {}
 local Job = require("plenary.job")
+local api = vim.api
+local fn = vim.fn
 
+local group = api.nvim_create_augroup("DING_LLM_AutoGroup", { clear = true })
+local active_job = nil
+
+-- Helper to safely get environment variable
 local function get_api_key(name)
-	return os.getenv(name)
+	if not name then
+		vim.notify("API key name not configured", vim.log.levels.WARN)
+		return nil
+	end
+	local key = os.getenv(name)
+	if not key then
+		vim.notify("API key environment variable not found: " .. name, vim.log.levels.WARN)
+	end
+	return key
 end
 
+-- Get text from buffer start to cursor
 function M.get_lines_until_cursor()
-	local current_buffer = vim.api.nvim_get_current_buf()
-	local current_window = vim.api.nvim_get_current_win()
-	local cursor_position = vim.api.nvim_win_get_cursor(current_window)
-	local row = cursor_position[1]
+	local current_buffer = api.nvim_get_current_buf()
+	local current_window = api.nvim_get_current_win()
+	local cursor_position = api.nvim_win_get_cursor(current_window)
+	local row = cursor_position[1] -- 1-based row
 
-	local lines = vim.api.nvim_buf_get_lines(current_buffer, 0, row, true)
+	-- Get lines from start (0) up to (but not including) cursor row
+	local lines = api.nvim_buf_get_lines(current_buffer, 0, row - 1, true)
+	-- Get the part of the cursor line up to the cursor column
+	local cursor_line_content = api.nvim_buf_get_lines(current_buffer, row - 1, row, true)[1] or ""
+	local col = cursor_position[2] -- 0-based column
+	table.insert(lines, string.sub(cursor_line_content, 1, col))
 
 	return table.concat(lines, "\n")
 end
 
-function M.get_visual_selection()
-	local _, srow, scol = unpack(vim.fn.getpos("v"))
-	local _, erow, ecol = unpack(vim.fn.getpos("."))
-
-	if vim.fn.mode() == "V" then
-		if srow > erow then
-			return vim.api.nvim_buf_get_lines(0, erow - 1, srow, true)
-		else
-			return vim.api.nvim_buf_get_lines(0, srow - 1, erow, true)
-		end
+-- Get text from visual selection
+-- Returns { text = "selected text", start_pos = {row, col}, end_pos = {row, col} } or nil
+-- Positions are 0-indexed for API calls
+function M.get_visual_selection_info()
+	local mode = fn.mode()
+	if mode ~= "v" and mode ~= "V" and mode ~= "\22" then
+		return nil -- Not in visual mode
 	end
 
-	if vim.fn.mode() == "v" then
-		if srow < erow or (srow == erow and scol <= ecol) then
-			return vim.api.nvim_buf_get_text(0, srow - 1, scol - 1, erow - 1, ecol, {})
-		else
-			return vim.api.nvim_buf_get_text(0, erow - 1, ecol - 1, srow - 1, scol, {})
-		end
+	-- '< and '> marks store start and end of last visual selection
+	local start_pos_vim = fn.getpos("'<")
+	local end_pos_vim = fn.getpos("'.") -- Use '.' for precise end in char mode
+
+	-- Convert vim pos [bufnum, lnum, col, off] to 0-indexed {row, col}
+	-- Note: fn.getpos 'col' is 1-based byte index. API uses 0-based byte index.
+	local srow, scol = start_pos_vim[2] - 1, start_pos_vim[3] - 1
+	local erow, ecol = end_pos_vim[2] - 1, end_pos_vim[3] - 1
+
+	local text_lines
+
+	-- Ensure start is before end for API calls
+	if srow > erow or (srow == erow and scol > ecol) then
+		srow, erow = erow, srow
+		scol, ecol = ecol, scol
 	end
 
-	if vim.fn.mode() == "\22" then
-		local lines = {}
-		if srow > erow then
-			srow, erow = erow, srow
-		end
-		if scol > ecol then
-			scol, ecol = ecol, scol
+	-- Adjust end column for nvim_buf_get_text (exclusive)
+	-- For linewise ('V') and blockwise ('\22'), we get full lines or columns later.
+	-- For charwise ('v'), getpos('.') col points *at* the char, nvim_buf_get_text needs col *after* char.
+	-- However, empirical testing often shows using the direct col value works as expected
+	-- due to how selections vs cursor positions are reported. Let's stick to the direct mapping
+	-- and adjust if needed based on testing different selections.
+	-- local text_opts = {} might be needed for UTF8 handling if issues arise
+
+	if mode == "V" then -- Linewise
+		text_lines = api.nvim_buf_get_lines(0, srow, erow + 1, true) -- erow+1 because end is exclusive
+		-- For linewise, selection end is start of the line usually, adjust col if needed
+		ecol = fn.col("$") - 1 -- End of the line
+	elseif mode == "\22" then -- Blockwise
+		text_lines = {}
+		local min_scol, max_ecol = scol, ecol -- Use the actual selection columns
+		if start_pos_vim[3] > end_pos_vim[3] then -- Check original vim pos for block col swap
+			min_scol, max_ecol = ecol, scol
 		end
 		for i = srow, erow do
-			table.insert(
-				lines,
-				vim.api.nvim_buf_get_text(0, i - 1, math.min(scol - 1, ecol), i - 1, math.max(scol - 1, ecol), {})[1]
-			)
+			-- Ensure we don't request negative columns
+			local line_scol = math.max(0, min_scol)
+			-- Get text returns a list, take first element
+			local line_text = api.nvim_buf_get_text(0, i, line_scol, i, max_ecol, {})[1] or ""
+			table.insert(text_lines, line_text)
 		end
-		return lines
+		scol = min_scol -- Use the actual start column for positioning
+		ecol = max_ecol -- Use the actual end column for positioning
+	else -- Charwise ('v')
+		-- nvim_buf_get_text end_col is exclusive.
+		text_lines = api.nvim_buf_get_text(0, srow, scol, erow, ecol, {})
 	end
+
+	return {
+		text = table.concat(text_lines, "\n"),
+		start_pos = { srow, scol }, -- 0-indexed row, col
+		end_pos = { erow, ecol }, -- 0-indexed row, col for end of selection
+	}
 end
 
-function M.make_anthropic_spec_curl_args(opts, prompt, system_prompt)
-	local url = opts.url
-	local api_key = opts.api_key_name and get_api_key(opts.api_key_name)
-	local data = {
-		system = system_prompt,
-		messages = { { role = "user", content = prompt } },
-		model = opts.model,
-		stream = true,
-		max_tokens = 4096,
-	}
-	local args = { "-N", "-X", "POST", "-H", "Content-Type: application/json", "-d", vim.json.encode(data) }
-	if api_key then
-		table.insert(args, "-H")
-		table.insert(args, "x-api-key: " .. api_key)
-		table.insert(args, "-H")
-		table.insert(args, "anthropic-version: 2023-06-01")
+-- Prepare context (prompt) based on visual selection or cursor position
+-- Returns { prompt = "...", replace_range = {start_pos, end_pos} or nil }
+local function get_context(opts)
+	local context = {}
+	local selection_info = M.get_visual_selection_info()
+
+	if selection_info then
+		context.prompt = selection_info.text
+		if opts.replace then
+			context.replace_range = { selection_info.start_pos, selection_info.end_pos }
+			-- Delete the selection BEFORE starting the job
+			-- Use API for robustness if possible, fallback to normal command
+			vim.cmd('normal! gv"_d') -- Delete visual selection to black hole register
+			-- Set cursor to the start of deleted range (API uses 1-based row)
+			api.nvim_win_set_cursor(0, { selection_info.start_pos[1] + 1, selection_info.start_pos[2] })
+		else
+			-- Escape visual mode if not replacing
+			api.nvim_feedkeys(api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
+		end
+	else
+		-- No visual selection, get lines until cursor
+		context.prompt = M.get_lines_until_cursor()
+		-- No replacement range if not visual
+		context.replace_range = nil
+		-- Cursor is already where we want to insert
 	end
+
+	return context
+end
+
+-- Writes streamed text into the buffer at the current cursor position
+function M.write_string_at_cursor(str)
+	-- Ensure execution in the main Neovim loop
+	vim.schedule(function()
+		if not str or str == "" then
+			return
+		end
+
+		local current_window = api.nvim_get_current_win()
+		local cursor_pos = api.nvim_win_get_cursor(current_window) -- {row, col} 1-based row, 0-based col
+		local buffer_handle = api.nvim_get_current_buf()
+
+		-- Split incoming potentially multi-line string
+		local lines = vim.split(str, "\n", { plain = true }) -- plain=true treats \n literally
+
+		-- Use undojoin to group this insertion with previous ones from the same stream
+		vim.cmd("undojoin")
+
+		-- Insert the text character-wise, after the cursor, following cursor
+		-- NOTE: nvim_buf_set_text is often more robust for programmatic insertion
+		local start_row, start_col = cursor_pos[1] - 1, cursor_pos[2] -- Convert to 0-indexed row/col
+		local end_row, end_col = start_row, start_col -- Placeholder, will be adjusted by insertion
+
+		-- Calculate end position after insertion
+		local num_lines = #lines
+		if num_lines == 1 then
+			end_row = start_row
+			end_col = start_col + #lines[1]
+		else
+			end_row = start_row + num_lines - 1
+			end_col = #lines[num_lines] -- Col position on the new last line
+		end
+
+		-- Insert using nvim_buf_set_text (handles existing text shifting)
+		api.nvim_buf_set_text(buffer_handle, start_row, start_col, start_row, start_col, lines)
+
+		-- Set cursor position to the end of the inserted text
+		api.nvim_win_set_cursor(current_window, { end_row + 1, end_col }) -- API needs 1-based row
+
+		-- Trigger InsertLeave momentarily to potentially help with syntax highlighting or LSP updates
+		-- vim.cmd('silent! normal! gi')
+		-- vim.cmd('stopinsert')
+		-- This can be disruptive, use with caution or make optional
+	end)
+end
+
+-----------------------------------------------------------------------
+-- Provider Specific Functions: Curl Args & Data Handlers
+-----------------------------------------------------------------------
+
+-- Anthropic
+function M.make_anthropic_spec_curl_args(opts, prompt, system_prompt)
+	local url = opts.url or "https://api.anthropic.com/v1/messages"
+	local api_key = get_api_key(opts.api_key_name or "ANTHROPIC_API_KEY")
+	if not api_key then
+		return nil
+	end -- Don't proceed without key
+
+	local data = {
+		system = system_prompt or "You are a helpful assistant.", -- More neutral default
+		messages = { { role = "user", content = prompt } },
+		model = opts.model or "claude-3-opus-20240229",
+		stream = true,
+		max_tokens = opts.max_tokens or 4096,
+		-- temperature = opts.temperature, -- Add if needed
+	}
+	local args = {
+		"-N",
+		"-X",
+		"POST",
+		"-H",
+		"Content-Type: application/json",
+		"-H",
+		"anthropic-version: 2023-06-01",
+		"-H",
+		"x-api-key: " .. api_key,
+		"-d",
+		vim.json.encode(data),
+	}
 	table.insert(args, url)
 	return args
 end
 
-function M.make_ollama_spec_curl_args(opts, prompt)
+function M.handle_anthropic_spec_data(line, event_state) -- Now receives event_state if needed
+	-- Anthropic uses SSE format: event: type\ndata: {json}\n\n
+	-- We only care about lines starting with 'data: '
+	if line:match("^data:") then
+		local data_json = line:sub(7) -- Get substring after "data: "
+		if data_json == "[DONE]" then
+			return
+		end -- OpenAI specific, but good practice
+
+		local ok, decoded = pcall(vim.json.decode, data_json)
+		if ok and decoded then
+			-- Check based on Anthropic's streaming structure
+			if decoded.type == "content_block_delta" and decoded.delta and decoded.delta.type == "text_delta" then
+				M.write_string_at_cursor(decoded.delta.text)
+			elseif decoded.type == "message_delta" and decoded.delta and decoded.delta.stop_reason then
+				-- Stream finished
+				-- print("Anthropic stream finished. Reason: " .. decoded.delta.stop_reason)
+			elseif decoded.type == "error" then
+				vim.notify(
+					"Anthropic API Error: " .. (decoded.error and decoded.error.message or vim.inspect(decoded)),
+					vim.log.levels.ERROR
+				)
+			end
+		else
+			vim.notify("Failed to decode Anthropic JSON: " .. data_json, vim.log.levels.WARN)
+		end
+	end
+	-- We could also check `event_state` here if needed for more complex SSE handling
+end
+
+-- Ollama
+function M.make_ollama_spec_curl_args(opts, prompt, system_prompt)
 	local url = opts.url or "http://localhost:11434/api/generate"
 	local data = {
-		model = opts.model or "llama3.2",
+		model = opts.model or "llama3",
 		prompt = prompt,
+		system = system_prompt, -- Ollama supports system prompt
+		stream = true, -- Explicitly request streaming
+		-- options = { temperature = opts.temperature, num_predict = opts.max_tokens } -- Add if needed
 	}
 	local args = {
-		"-N",
+		"-N", -- No buffering
 		"-X",
 		"POST",
 		"-H",
@@ -94,191 +268,217 @@ function M.make_ollama_spec_curl_args(opts, prompt)
 	return args
 end
 
-function M.make_openai_spec_curl_args(opts, prompt, system_prompt)
-	local url = opts.url
-	local api_key = opts.api_key_name and get_api_key(opts.api_key_name)
-	local data = {
-		messages = { { role = "system", content = system_prompt }, { role = "user", content = prompt } },
-		model = opts.model,
-		temperature = 0.7,
-		stream = true,
-	}
-	local args = { "-N", "-X", "POST", "-H", "Content-Type: application/json", "-d", vim.json.encode(data) }
-	if api_key then
-		table.insert(args, "-H")
-		table.insert(args, "Authorization: Bearer " .. api_key)
+function M.handle_ollama_spec_data(line, _) -- event_state not used
+	-- Ollama streams newline-delimited JSON objects
+	local ok, decoded = pcall(vim.json.decode, line)
+	if ok and decoded then
+		if decoded.response then
+			M.write_string_at_cursor(decoded.response)
+		end
+		if decoded.error then
+			vim.notify("Ollama API Error: " .. decoded.error, vim.log.levels.ERROR)
+		end
+		if decoded.done and decoded.done == true then
+			-- Stream finished
+			-- print("Ollama stream finished.")
+		end
+	else
+		-- Ignore lines that aren't valid JSON (e.g., potentially empty lines)
+		-- Only warn if pcall failed but line wasn't empty
+		if not ok and line ~= "" then
+			vim.notify("Failed to decode Ollama JSON: " .. line, vim.log.levels.WARN)
+		end
 	end
+end
+
+-- OpenAI
+function M.make_openai_spec_curl_args(opts, prompt, system_prompt)
+	local url = opts.url or "https://api.openai.com/v1/chat/completions"
+	local api_key = get_api_key(opts.api_key_name or "OPENAI_API_KEY")
+	if not api_key then
+		return nil
+	end -- Don't proceed without key
+
+	local messages = {}
+	if system_prompt then
+		table.insert(messages, { role = "system", content = system_prompt })
+	end
+	table.insert(messages, { role = "user", content = prompt })
+
+	local data = {
+		messages = messages,
+		model = opts.model or "gpt-4o",
+		temperature = opts.temperature or 0.7,
+		stream = true,
+		-- max_tokens = opts.max_tokens, -- Add if needed
+	}
+	local args = {
+		"-N",
+		"-X",
+		"POST",
+		"-H",
+		"Content-Type: application/json",
+		"-H",
+		"Authorization: Bearer " .. api_key,
+		"-d",
+		vim.json.encode(data),
+	}
 	table.insert(args, url)
 	return args
 end
 
-function M.write_string_at_cursor(str)
-	vim.schedule(function()
-		local current_window = vim.api.nvim_get_current_win()
-		local cursor_position = vim.api.nvim_win_get_cursor(current_window)
-		local row, col = cursor_position[1], cursor_position[2]
-
-		local lines = vim.split(str, "\n")
-
-		vim.cmd("undojoin")
-		vim.api.nvim_put(lines, "c", true, true)
-
-		local num_lines = #lines
-		local last_line_length = #lines[num_lines]
-		vim.api.nvim_win_set_cursor(current_window, { row + num_lines - 1, col + last_line_length })
-	end)
-end
-
-local function get_prompt(opts)
-	local replace = opts.replace
-	local visual_lines = M.get_visual_selection()
-	local prompt = ""
-
-	if visual_lines then
-		prompt = table.concat(visual_lines, "\n")
-		if replace then
-			vim.api.nvim_command("normal! d")
-			vim.api.nvim_command("normal! k")
-		else
-			vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", false, true, true), "nx", false)
-		end
-	else
-		prompt = M.get_lines_until_cursor()
-	end
-
-	return prompt
-end
-
-function M.handle_anthropic_spec_data(data_stream, event_state)
-	if event_state == "content_block_delta" then
-		local json = vim.json.decode(data_stream)
-		if json.delta and json.delta.text then
-			M.write_string_at_cursor(json.delta.text)
-		end
-	end
-end
-
-function M.handle_openai_spec_data(data_stream)
-	if data_stream:match('"delta":') then
-		local json = vim.json.decode(data_stream)
-		if json.choices and json.choices[1] and json.choices[1].delta then
-			local content = json.choices[1].delta.content
-			if content then
-				M.write_string_at_cursor(content)
-			end
-		end
-	end
-end
-
-function M.handle_ollama_spec_data(data_stream)
-	local ok, json = pcall(vim.json.decode, data_stream)
-	if ok and json and json.response then
-		M.write_string_at_cursor(json.response)
-	end
-end
-
-function M.prompt_ollama(opts)
-	opts = opts or {}
-	local prompt = get_prompt(opts)
-	local args = M.make_ollama_spec_curl_args({
-		url = opts.url or "http://localhost:11434/api/generate",
-		model = opts.model or "llama2",
-	}, prompt)
-
-	if active_job then
-		active_job:shutdown()
-		active_job = nil
-	end
-
-	active_job = Job:new({
-		command = "curl",
-		args = args,
-		on_stdout = function(_, line)
-			M.handle_ollama_spec_data(line)
-		end,
-		on_stderr = function(_, err)
-			print("Error:", err)
-		end,
-		on_exit = function()
-			active_job = nil
-		end,
-	})
-
-	active_job:start()
-
-	vim.api.nvim_clear_autocmds({ group = group })
-	vim.api.nvim_create_autocmd("User", {
-		group = group,
-		pattern = "DING_LLM_Escape",
-		callback = function()
-			if active_job then
-				active_job:shutdown()
-				print("LLM streaming cancelled")
-				active_job = nil
-			end
-		end,
-	})
-
-	vim.api.nvim_set_keymap("n", "<Esc>", ":doautocmd User DING_LLM_Escape<CR>", { noremap = true, silent = true })
-	return active_job
-end
-
-local group = vim.api.nvim_create_augroup("DING_LLM_AutoGroup", { clear = true })
-local active_job = nil
-
-function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_data_fn)
-	vim.api.nvim_clear_autocmds({ group = group })
-	local prompt = get_prompt(opts)
-	local system_prompt = opts.system_prompt
-		or "You are a tsundere uwu anime. Yell at me for not setting my configuration for my llm plugin correctly"
-	local args = make_curl_args_fn(opts, prompt, system_prompt)
-	local curr_event_state = nil
-
-	local function parse_and_call(line)
-		local event = line:match("^event: (.+)$")
-		if event then
-			curr_event_state = event
+function M.handle_openai_spec_data(line, _) -- event_state not used
+	-- OpenAI uses SSE format, usually just care about 'data: ' lines
+	if line:match("^data:") then
+		local data_json = line:sub(7) -- Get substring after "data: "
+		if data_json == "[DONE]" then
+			-- Stream finished
+			-- print("OpenAI stream finished.")
 			return
 		end
-		local data_match = line:match("^data: (.+)$")
-		if data_match then
-			handle_data_fn(data_match, curr_event_state)
+
+		local ok, decoded = pcall(vim.json.decode, data_json)
+		if ok and decoded then
+			if decoded.choices and decoded.choices[1] and decoded.choices[1].delta then
+				local content = decoded.choices[1].delta.content
+				if content then
+					M.write_string_at_cursor(content)
+				end
+				-- Could also check choices[1].finish_reason here
+			end
+			if decoded.error then
+				vim.notify(
+					"OpenAI API Error: " .. (decoded.error.message or vim.inspect(decoded.error)),
+					vim.log.levels.ERROR
+				)
+			end
+		else
+			vim.notify("Failed to decode OpenAI JSON: " .. data_json, vim.log.levels.WARN)
 		end
 	end
+end
 
+-----------------------------------------------------------------------
+-- Generic LLM Invocation
+-----------------------------------------------------------------------
+
+-- Stop the currently active LLM job, if any
+function M.cancel_llm_job()
 	if active_job then
-		active_job:shutdown()
+		active_job:shutdown() -- Send SIGTERM then SIGKILL
+		print("LLM streaming cancelled.")
 		active_job = nil
+		-- Clean up the escape mapping immediately
+		pcall(api.nvim_del_keymap, "n", "<Esc>")
+		pcall(api.nvim_del_keymap, "i", "<Esc>") -- Also consider if needed in insert mode
+	else
+		print("No active LLM job to cancel.")
+	end
+end
+
+-- Generic function to invoke an LLM and stream response
+-- opts: Table containing configuration like model, url, api_key_name, replace, etc.
+-- make_curl_args_fn: Function(opts, prompt, system_prompt) -> curl_args table or nil
+-- handle_data_fn: Function(line, event_state) -> handles single line of stdout
+function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_data_fn)
+	opts = opts or {}
+
+	-- Stop any previous job first
+	M.cancel_llm_job()
+
+	local context = get_context(opts)
+	if not context or not context.prompt or context.prompt == "" then
+		vim.notify("No prompt generated (no selection or text before cursor?)", vim.log.levels.WARN)
+		return
 	end
 
+	local prompt = context.prompt
+	local system_prompt = opts.system_prompt -- Allow backend default if nil
+
+	local args = make_curl_args_fn(opts, prompt, system_prompt)
+	if not args then
+		vim.notify("Failed to prepare LLM request (missing API key or bad config?)", vim.log.levels.ERROR)
+		return
+	end
+
+	-- Plenary Job setup
 	active_job = Job:new({
 		command = "curl",
 		args = args,
-		on_stdout = function(_, out)
-			parse_and_call(out)
-		end,
-		on_stderr = function(_, _) end,
-		on_exit = function()
-			active_job = nil
-		end,
+		-- Enable stderr streaming to catch curl errors early
+		stderr_buffered = false, -- Stream stderr line-by-line
+		on_stdout = vim.schedule_wrap(function(_, line)
+			-- Pass raw line directly to the specific handler
+			handle_data_fn(line, nil) -- Pass nil for event_state for now
+		end),
+		on_stderr = vim.schedule_wrap(function(_, line)
+			-- Log stderr, could be curl errors or API errors before JSON response
+			if line and line ~= "" then
+				vim.notify("LLM Job stderr: " .. line, vim.log.levels.WARN)
+			end
+		end),
+		on_exit = vim.schedule_wrap(function(_, code)
+			if code ~= 0 then
+				-- Don't show error if manually cancelled (code might be nil or non-zero)
+				if active_job then -- Check if it's nil because cancel_llm_job sets it to nil
+					vim.notify("LLM Job exited with code: " .. tostring(code), vim.log.levels.ERROR)
+				end
+			end
+			-- Clean up regardless of exit code
+			active_job = nil -- Mark job as finished
+			-- Ensure Escape keymap is removed
+			pcall(api.nvim_del_keymap, "n", "<Esc>")
+			pcall(api.nvim_del_keymap, "i", "<Esc>")
+			print("LLM Job finished.") -- Optional notification
+		end),
 	})
 
 	active_job:start()
+	print("LLM Job started...") -- Optional notification
 
-	vim.api.nvim_create_autocmd("User", {
-		group = group,
-		pattern = "DING_LLM_Escape",
-		callback = function()
-			if active_job then
-				active_job:shutdown()
-				print("LLM streaming cancelled")
-				active_job = nil
-			end
-		end,
-	})
+	-- Setup cancellation via Escape key
+	-- Use a command to trigger the cancel function cleanly
+	vim.cmd('command! DingLLMCancel lua require("your_plugin_name.llm").cancel_llm_job()') -- Adjust path
+	api.nvim_set_keymap(
+		"n",
+		"<Esc>",
+		":DingLLMCancel<CR>",
+		{ noremap = true, silent = true, desc = "Cancel LLM Stream" }
+	)
+	-- Optional: Also allow cancel from insert mode?
+	api.nvim_set_keymap(
+		"i",
+		"<Esc>",
+		"<Esc>:DingLLMCancel<CR>",
+		{ noremap = true, silent = true, desc = "Cancel LLM Stream" }
+	)
 
-	vim.api.nvim_set_keymap("n", "<Esc>", ":doautocmd User DING_LLM_Escape<CR>", { noremap = true, silent = true })
 	return active_job
+end
+
+-----------------------------------------------------------------------
+-- Public API Functions (Examples)
+-----------------------------------------------------------------------
+
+-- Example: Function to trigger Ollama completion
+function M.complete_with_ollama(opts)
+	opts = opts or {}
+	opts.provider = "ollama" -- Add provider info if needed elsewhere
+	M.invoke_llm_and_stream_into_editor(opts, M.make_ollama_spec_curl_args, M.handle_ollama_spec_data)
+end
+
+-- Example: Function to trigger OpenAI completion
+function M.complete_with_openai(opts)
+	opts = opts or {}
+	opts.provider = "openai"
+	M.invoke_llm_and_stream_into_editor(opts, M.make_openai_spec_curl_args, M.handle_openai_spec_data)
+end
+
+-- Example: Function to trigger Anthropic completion
+function M.complete_with_anthropic(opts)
+	opts = opts or {}
+	opts.provider = "anthropic"
+	M.invoke_llm_and_stream_into_editor(opts, M.make_anthropic_spec_curl_args, M.handle_anthropic_spec_data)
 end
 
 return M
