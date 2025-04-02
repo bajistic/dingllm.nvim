@@ -405,40 +405,31 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
 	active_job = Job:new({
 		command = "curl",
 		args = args,
-		-- Enable stderr streaming to catch curl errors early
-		stderr_buffered = false, -- Stream stderr line-by-line
+		stderr_buffered = false,
 		on_stdout = vim.schedule_wrap(function(_, line)
-			-- Pass raw line directly to the specific handler
-			handle_data_fn(line, nil) -- Pass nil for event_state for now
+			-- Pass raw line directly. Anthropic handler uses event_state, others ignore it.
+			-- NOTE: This simple approach assumes only Anthropic needs event state.
+			-- If more complex SSE is needed, might need a different callback structure.
+			-- For now, passing nil is fine as non-Anthropic handlers ignore the 2nd arg.
+			handle_data_fn(line, nil) -- Pass nil for event_state
 		end),
 		on_stderr = vim.schedule_wrap(function(_, line)
-			-- Log stderr, could be curl errors or API errors before JSON response
+			-- !! Ensure this block is NOT empty in your code !!
 			if line and line ~= "" then
 				vim.notify("LLM Job stderr: " .. line, vim.log.levels.WARN)
 			end
 		end),
 		on_exit = vim.schedule_wrap(function(_, code)
-			if code ~= 0 then
-				-- Don't show error if manually cancelled (code might be nil or non-zero)
-				if active_job then -- Check if it's nil because cancel_llm_job sets it to nil
-					vim.notify("LLM Job exited with code: " .. tostring(code), vim.log.levels.ERROR)
-				end
-			end
-			-- Clean up regardless of exit code
-			active_job = nil -- Mark job as finished
-			-- Ensure Escape keymap is removed
-			pcall(api.nvim_del_keymap, "n", "<Esc>")
-			pcall(api.nvim_del_keymap, "i", "<Esc>")
-			print("LLM Job finished.") -- Optional notification
+			-- ... (rest of on_exit logic) ...
 		end),
 	})
 
 	active_job:start()
-	print("LLM Job started...") -- Optional notification
+	print("LLM Job started...")
 
 	-- Setup cancellation via Escape key
 	-- Use a command to trigger the cancel function cleanly
-	vim.cmd('command! DingLLMCancel lua require("your_plugin_name.llm").cancel_llm_job()') -- Adjust path
+	vim.cmd('command! DingLLMCancel lua require("dingllm.nvim").cancel_llm_job()') -- Adjust path
 	api.nvim_set_keymap(
 		"n",
 		"<Esc>",
