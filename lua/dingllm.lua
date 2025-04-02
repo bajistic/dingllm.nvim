@@ -430,7 +430,7 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
 	-- Setup cancellation via Escape key
 	-- Use a command to trigger the cancel function cleanly
 	-- Setup cancellation command and keymaps (using the autogroup name implicitly)
-	vim.cmd('command! -bang DingLLMCancel lua require("your_plugin_name.llm").cancel_llm_job()') -- Added -bang to allow overriding if needed
+	vim.cmd('command! -bang DingLLMCancel lua require("dingllm.nvim").cancel_llm_job()') -- Added -bang to allow overriding if needed
 	api.nvim_set_keymap(
 		"n",
 		"<Esc>",
