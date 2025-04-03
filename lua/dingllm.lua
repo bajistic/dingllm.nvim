@@ -258,6 +258,14 @@ function M.make_gemini_spec_curl_args(opts, prompt, system_prompt)
 		-- safetySettings = { ... } -- Optional: Add safety settings if needed
 	}
 
+	-- *** Add grounding tools if requested ***
+	if opts.grounding == true then
+		print("[dingllm_debug] Grounding with Google Search enabled.")
+		data.tools = { { google_search = {} } }
+	else
+		print("[dingllm_debug] Grounding with Google Search disabled.")
+	end
+
 	-- Add -sS for silent operation, show errors
 	local args = {
 		"-sS",
